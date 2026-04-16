@@ -1,0 +1,552 @@
+// File: MyAssignmentController.java
+// Description: Waypoint-based exploration controller for COMP329 (Supervisor mode)
+//
+// Strategy:
+// 1) Build/update OccupancyGrid continuously.
+// 2) Use FSM to select and visit waypoints.
+// 3) Waypoints are laid out in a serpentine sweep across the arena interior.
+// 4) Next waypoint chosen by scoring:
+//      score = (unknown cells near waypoint) - (distance penalty) - (visited penalties)
+// 5) Use A* on the occupancy grid to plan a path to the chosen waypoint.
+// 6) Follow the path as a sequence of sub-goals (forces robot through gaps).
+// 7) If stuck -> short random recovery hop, then resume waypoint selection.
+//
+// Obstacle avoidance remains in PioneerCLNav (Bug1 + bumper micro-rotate fallback).
+
+import com.cyberbotics.webots.controller.Supervisor;
+import com.cyberbotics.webots.controller.Node;
+import com.cyberbotics.webots.controller.Field;
+
+import java.util.*;
+
+public class MyAssignmentController {
+
+  // ---------------------------
+  // Exploration FSM
+  private enum ExploreState { START, SELECT_WAYPOINT, FOLLOW_PATH, RECOVER, FINISH }
+
+  // Occupancy thresholds
+  private static final double KNOWN_FREE_THRESH = 0.25;
+  private static final double KNOWN_OCC_THRESH  = 0.75;
+
+  // Termination
+  private static final double TARGET_COVERAGE = 0.95;
+  private static final double MAX_SECONDS     = 7 * 60;
+
+  // Startup warmup to seed map
+  private static final double START_WARMUP_SECS = 1.0;
+
+  // Stuck detection
+  private static final double STUCK_DIST = 0.10; // m
+  private static final int    STUCK_SECS = 7;
+
+  // Arena margin
+  private static final double ARENA_MARGIN = 0.55;
+
+  // Waypoints
+  private static final double WAYPOINT_SPACING = 0.8; // m
+  private static final double W_UNKNOWN = 1.0;
+  private static final double W_DIST    = 0.5;
+  private static final double VISITED_PENALTY = 200.0;
+
+  // Local scoring window around waypoint (cells)
+  private static final int WINDOW_RADIUS_CELLS = 8;
+
+  // Recovery hop
+  private static final double REC_MIN_DIST = 1.0;
+  private static final double REC_MAX_DIST = 2.0;
+
+  // ---------------------------
+  // A* tuning
+  // Allow UNKNOWN but penalise it (so it prefers known free, but still explores)
+  private static final double UNKNOWN_STEP_PENALTY = 2.0;
+
+  // Optional “keep away from walls” penalty: if any neighbour is occupied, add cost
+  private static final double NEAR_WALL_PENALTY = 0.5;
+
+  // How often we downsample path into subgoals (cells)
+  private static final int PATH_STRIDE_CELLS = 8;
+
+  public static void main(String[] args) {
+
+    Supervisor robot = new Supervisor();
+    int timeStep = (int) Math.round(robot.getBasicTimeStep());
+
+    PioneerSimpleProxSensors pps = new PioneerSimpleProxSensors(robot);
+    PioneerCLNav nav = new PioneerCLNav(robot, pps);
+
+    OccupancyGrid ogrid = new OccupancyGrid(robot, 20, "display", nav.get_real_pose(), pps);
+
+    // Arena bounds
+    Node arena = robot.getFromDef("ARENA");
+    if (arena == null) {
+      System.err.println("ARENA node not found (DEF ARENA).");
+      return;
+    }
+    Field floorSizeField = arena.getField("floorSize");
+    double[] floorSize = floorSizeField.getSFVec2f();
+    double arenaW = floorSize[0]; // 6.0
+    double arenaH = floorSize[1]; // 6.0
+
+    // Build sweep waypoints
+    List<Pose> waypoints = buildSerpentineWaypoints(arenaW, arenaH, ARENA_MARGIN, WAYPOINT_SPACING);
+    boolean[] visitedWaypoints = new boolean[waypoints.size()];
+
+    // “visitedGoalCells[]” requested (stored for later)
+    boolean[] visitedGoalCells = new boolean[ogrid.get_grid_size()];
+
+    ExploreState state = ExploreState.START;
+
+    double startTime = robot.getTime();
+    double warmupEnd = startTime + START_WARMUP_SECS;
+
+    double lastCoverageTime = startTime;
+    double lastImprovementTime = startTime;
+    double bestCoverage = 0.0;
+
+    Pose lastProgressPose = nav.get_real_pose();
+    double lastProgressTime = startTime;
+
+    Random rng = new Random(42);
+
+    // Path-following state
+    ArrayList<Pose> currentPath = new ArrayList<>();
+    int pathPtr = 0;
+    int currentWpIndex = -1;
+
+    System.out.println("Waypoint + A* exploration started (" + waypoints.size() + " waypoints).");
+
+    while (robot.step(timeStep) != -1) {
+
+      Pose pose = nav.get_real_pose();
+
+      // Mapping
+      ogrid.map(pose);
+      ogrid.paint();
+
+      double now = robot.getTime();
+
+      // Coverage check
+      if (now - lastCoverageTime >= 1.0) {
+        lastCoverageTime = now;
+
+        double cov = computeCoverage(ogrid);
+        System.out.println(String.format("Coverage: %.2f%%", cov * 100.0));
+
+        if (cov > bestCoverage + 0.005) {
+          bestCoverage = cov;
+          lastImprovementTime = now;
+        }
+
+        if (cov >= TARGET_COVERAGE) state = ExploreState.FINISH;
+        if ((now - lastImprovementTime) > 70.0) state = ExploreState.FINISH;
+        if ((now - startTime) > MAX_SECONDS) state = ExploreState.FINISH;
+      }
+
+      // Stuck detection (only relevant when moving)
+      if (pose.get_range(lastProgressPose) > STUCK_DIST) {
+        lastProgressPose = new Pose(pose);
+        lastProgressTime = now;
+      }
+      boolean stuck = (now - lastProgressTime) > STUCK_SECS;
+
+      switch (state) {
+
+        case START: {
+          nav.stop();
+          if (now >= warmupEnd) state = ExploreState.SELECT_WAYPOINT;
+          break;
+        }
+
+        case SELECT_WAYPOINT: {
+          if (allVisited(visitedWaypoints)) {
+            System.out.println("All waypoints visited -> reset for second pass.");
+            Arrays.fill(visitedWaypoints, false);
+          }
+
+          // Pick a waypoint that looks promising
+          currentWpIndex = selectBestWaypoint(waypoints, visitedWaypoints, visitedGoalCells,
+                  ogrid, pose, arenaW, arenaH, rng);
+
+          Pose wp = waypoints.get(currentWpIndex);
+
+          // Mark goal cell visited (for later use)
+          int cols = ogrid.get_num_row_cells();
+          int rows = ogrid.get_num_col_cells();
+          int wpIdx = worldToIndex(wp.getX(), wp.getY(), arenaW, arenaH, cols, rows);
+          if (wpIdx >= 0 && wpIdx < visitedGoalCells.length) visitedGoalCells[wpIdx] = true;
+
+          // ---------------------------
+          // A* plan from robot -> waypoint
+          int startIdx = worldToIndex(pose.getX(), pose.getY(), arenaW, arenaH, cols, rows);
+          int goalIdx  = worldToIndex(wp.getX(),   wp.getY(),   arenaW, arenaH, cols, rows);
+
+          List<Integer> pathIdxs = AStar.plan(ogrid, cols, rows, startIdx, goalIdx,
+                  KNOWN_FREE_THRESH, KNOWN_OCC_THRESH,
+                  UNKNOWN_STEP_PENALTY, NEAR_WALL_PENALTY);
+
+          if (pathIdxs == null || pathIdxs.size() < 2) {
+            // Not currently reachable with what we know -> mark visited and try another
+            visitedWaypoints[currentWpIndex] = true;
+            System.out.println("A* failed for waypoint #" + currentWpIndex + " -> try another.");
+            break;
+          }
+
+          // Convert path into sub-goals (downsample)
+          currentPath.clear();
+          pathPtr = 0;
+
+          for (int k = 0; k < pathIdxs.size(); k += PATH_STRIDE_CELLS) {
+            Pose g = indexToWorld(pathIdxs.get(k), arenaW, arenaH, cols, rows);
+            currentPath.add(g);
+          }
+          // Ensure final waypoint is the last subgoal
+          currentPath.add(new Pose(wp));
+
+          Pose first = currentPath.get(0);
+          System.out.println(String.format("Waypoint #%d -> path with %d subgoals. First (%.2f, %.2f)",
+                  currentWpIndex, currentPath.size(), first.getX(), first.getY()));
+
+          nav.set_goal(first);
+          lastProgressPose = new Pose(pose);
+          lastProgressTime = now;
+
+          state = ExploreState.FOLLOW_PATH;
+          break;
+        }
+
+        case FOLLOW_PATH: {
+          boolean reached = nav.update();
+
+          if (stuck) {
+            System.out.println("STUCK -> RECOVER");
+            state = ExploreState.RECOVER;
+            break;
+          }
+
+          if (reached) {
+            pathPtr++;
+            if (pathPtr >= currentPath.size()) {
+              // Finished this waypoint path
+              if (currentWpIndex >= 0 && currentWpIndex < visitedWaypoints.length)
+                visitedWaypoints[currentWpIndex] = true;
+              state = ExploreState.SELECT_WAYPOINT;
+            } else {
+              Pose next = currentPath.get(pathPtr);
+              nav.set_goal(next);
+              lastProgressPose = nav.get_real_pose();
+              lastProgressTime = now;
+            }
+          }
+          break;
+        }
+
+        case RECOVER: {
+          Pose rec = makeRecoveryGoal(rng, pose, arenaW, arenaH, ARENA_MARGIN, REC_MIN_DIST, REC_MAX_DIST);
+          System.out.println(String.format("Recovery goal -> (%.2f, %.2f)", rec.getX(), rec.getY()));
+          nav.set_goal(rec);
+
+          lastProgressPose = new Pose(pose);
+          lastProgressTime = now;
+
+          // After recovery, re-select waypoint (fresh A*)
+          state = ExploreState.SELECT_WAYPOINT;
+          break;
+        }
+
+        case FINISH: {
+          nav.stop();
+          System.out.println("Exploration finished.");
+          return;
+        }
+      }
+    }
+  }
+
+  // ---------------------------
+  // Coverage
+  private static double computeCoverage(OccupancyGrid ogrid) {
+    int n = ogrid.get_grid_size();
+    int known = 0;
+    for (int i = 0; i < n; i++) {
+      double p = ogrid.get_cell_probability(i);
+      if (p <= KNOWN_FREE_THRESH || p >= KNOWN_OCC_THRESH) known++;
+    }
+    return known / (double) n;
+  }
+
+  // ---------------------------
+  // Serpentine sweep waypoints
+  private static List<Pose> buildSerpentineWaypoints(double arenaW, double arenaH, double margin, double spacing) {
+    ArrayList<Pose> wps = new ArrayList<>();
+
+    double xmin = -arenaW / 2.0 + margin;
+    double xmax =  arenaW / 2.0 - margin;
+    double ymin = -arenaH / 2.0 + margin;
+    double ymax =  arenaH / 2.0 - margin;
+
+    int row = 0;
+    for (double y = ymin; y <= ymax + 1e-9; y += spacing) {
+      if ((row % 2) == 0) {
+        for (double x = xmin; x <= xmax + 1e-9; x += spacing) wps.add(new Pose(x, y, 0.0));
+      } else {
+        for (double x = xmax; x >= xmin - 1e-9; x -= spacing) wps.add(new Pose(x, y, 0.0));
+      }
+      row++;
+    }
+    return wps;
+  }
+
+  // ---------------------------
+  // Waypoint selection by UNKNOWN-nearby score
+  private static int selectBestWaypoint(List<Pose> waypoints,
+                                       boolean[] visitedWaypoints,
+                                       boolean[] visitedGoalCells,
+                                       OccupancyGrid ogrid,
+                                       Pose robotPose,
+                                       double arenaW,
+                                       double arenaH,
+                                       Random rng) {
+
+    int cols = ogrid.get_num_row_cells();
+    int rows = ogrid.get_num_col_cells();
+
+    double bestScore = -1e18;
+    int bestIdx = 0;
+
+    for (int i = 0; i < waypoints.size(); i++) {
+      Pose wp = waypoints.get(i);
+
+      int unknown = countUnknownAround(ogrid, wp, arenaW, arenaH, cols, rows, WINDOW_RADIUS_CELLS);
+      double dist = robotPose.get_range(wp);
+
+      double visitedPenalty = visitedWaypoints[i] ? VISITED_PENALTY : 0.0;
+
+      int idx = worldToIndex(wp.getX(), wp.getY(), arenaW, arenaH, cols, rows);
+      double cellPenalty = (idx >= 0 && idx < visitedGoalCells.length && visitedGoalCells[idx])
+              ? (0.5 * VISITED_PENALTY) : 0.0;
+
+      // tiny noise avoids deterministic loops
+      double noise = (rng.nextDouble() - 0.5) * 0.5;
+
+      double score = (W_UNKNOWN * unknown) - (W_DIST * dist) - visitedPenalty - cellPenalty + noise;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = i;
+      }
+    }
+    return bestIdx;
+  }
+
+  private static int countUnknownAround(OccupancyGrid ogrid,
+                                       Pose wp,
+                                       double arenaW,
+                                       double arenaH,
+                                       int cols,
+                                       int rows,
+                                       int radCells) {
+    int centre = worldToIndex(wp.getX(), wp.getY(), arenaW, arenaH, cols, rows);
+    if (centre < 0) return 0;
+
+    int cx = centre % cols;
+    int cy = centre / cols;
+
+    int unknown = 0;
+    for (int dy = -radCells; dy <= radCells; dy++) {
+      int y = cy + dy;
+      if (y < 0 || y >= rows) continue;
+      for (int dx = -radCells; dx <= radCells; dx++) {
+        int x = cx + dx;
+        if (x < 0 || x >= cols) continue;
+        int idx = y * cols + x;
+        double p = ogrid.get_cell_probability(idx);
+        if (p > KNOWN_FREE_THRESH && p < KNOWN_OCC_THRESH) unknown++;
+      }
+    }
+    return unknown;
+  }
+
+  private static boolean allVisited(boolean[] visited) {
+    for (boolean v : visited) if (!v) return false;
+    return true;
+  }
+
+  // ---------------------------
+  // Recovery hop
+  private static Pose makeRecoveryGoal(Random rng, Pose pose,
+                                      double arenaW, double arenaH,
+                                      double margin,
+                                      double minD, double maxD) {
+
+    double ang = rng.nextDouble() * 2.0 * Math.PI;
+    double dist = minD + rng.nextDouble() * (maxD - minD);
+
+    double gx = pose.getX() + Math.cos(ang) * dist;
+    double gy = pose.getY() + Math.sin(ang) * dist;
+
+    double xmin = -arenaW / 2.0 + margin;
+    double xmax =  arenaW / 2.0 - margin;
+    double ymin = -arenaH / 2.0 + margin;
+    double ymax =  arenaH / 2.0 - margin;
+
+    gx = clamp(gx, xmin, xmax);
+    gy = clamp(gy, ymin, ymax);
+
+    return new Pose(gx, gy, 0.0);
+  }
+
+  // ---------------------------
+  // world->grid (same as your OccupancyGrid logic)
+  private static int worldToIndex(double x, double y,
+                                  double arenaW, double arenaH,
+                                  int cols, int rows) {
+    double x0 = -arenaW / 2.0;
+    double y0 =  arenaH / 2.0;
+
+    double x_inc = arenaW / cols;
+    double y_inc = arenaH / rows;
+
+    int ix = (int) Math.floor((x - x0) / x_inc);
+    int iy = (int) Math.floor((y0 - y) / y_inc);
+
+    if (ix < 0 || ix >= cols || iy < 0 || iy >= rows) return -1;
+    return iy * cols + ix;
+  }
+
+  // grid->world (cell center)
+  private static Pose indexToWorld(int idx, double arenaW, double arenaH, int cols, int rows) {
+    int ix = idx % cols;
+    int iy = idx / cols;
+
+    double x0 = -arenaW / 2.0;
+    double y0 =  arenaH / 2.0;
+
+    double x_inc = arenaW / cols;
+    double y_inc = arenaH / rows;
+
+    double wx = x0 + (ix + 0.5) * x_inc;
+    double wy = y0 - (iy + 0.5) * y_inc;
+    return new Pose(wx, wy, 0.0);
+  }
+
+  private static double clamp(double v, double lo, double hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  // ============================================================
+  // A* Planner (simple model)
+  // ============================================================
+  private static class AStar {
+
+    private static class PQNode {
+      int idx;
+      double f;
+      PQNode(int idx, double f) { this.idx = idx; this.f = f; }
+    }
+
+    static List<Integer> plan(OccupancyGrid ogrid,
+                              int cols, int rows,
+                              int startIdx, int goalIdx,
+                              double freeThresh, double occThresh,
+                              double unknownPenalty,
+                              double nearWallPenalty) {
+
+      if (startIdx < 0 || goalIdx < 0) return null;
+      if (startIdx == goalIdx) return Arrays.asList(startIdx);
+
+      int n = ogrid.get_grid_size();
+
+      double[] gScore = new double[n];
+      int[] cameFrom = new int[n];
+      boolean[] closed = new boolean[n];
+
+      Arrays.fill(gScore, Double.POSITIVE_INFINITY);
+      Arrays.fill(cameFrom, -1);
+
+      PriorityQueue<PQNode> open = new PriorityQueue<>(Comparator.comparingDouble(a -> a.f));
+
+      gScore[startIdx] = 0.0;
+      open.add(new PQNode(startIdx, heuristic(startIdx, goalIdx, cols)));
+
+      while (!open.isEmpty()) {
+        PQNode curN = open.poll();
+        int cur = curN.idx;
+
+        if (closed[cur]) continue;
+        closed[cur] = true;
+
+        if (cur == goalIdx) {
+          return reconstruct(cameFrom, cur);
+        }
+
+        for (int nb : neigh4(cur, cols, rows)) {
+          if (nb < 0) continue;
+          if (closed[nb]) continue;
+
+          double stepCost = 1.0;
+
+          // Cell classification
+          double p = ogrid.get_cell_probability(nb);
+
+          // blocked if occupied
+          if (p >= occThresh) continue;
+
+          // unknown cost
+          if (p > freeThresh && p < occThresh) stepCost += unknownPenalty;
+
+          // near-wall cost (discourages scraping along obstacles)
+          if (touchesOccupiedNeighbour(ogrid, nb, cols, rows, occThresh)) stepCost += nearWallPenalty;
+
+          double tentative = gScore[cur] + stepCost;
+          if (tentative < gScore[nb]) {
+            gScore[nb] = tentative;
+            cameFrom[nb] = cur;
+            double f = tentative + heuristic(nb, goalIdx, cols);
+            open.add(new PQNode(nb, f));
+          }
+        }
+      }
+
+      return null;
+    }
+
+    private static double heuristic(int a, int b, int cols) {
+      int ax = a % cols, ay = a / cols;
+      int bx = b % cols, by = b / cols;
+      // Manhattan distance
+      return Math.abs(ax - bx) + Math.abs(ay - by);
+    }
+
+    private static int[] neigh4(int idx, int cols, int rows) {
+      int x = idx % cols;
+      int y = idx / cols;
+
+      int up    = (y > 0)        ? (idx - cols) : -1;
+      int down  = (y < rows - 1) ? (idx + cols) : -1;
+      int left  = (x > 0)        ? (idx - 1)    : -1;
+      int right = (x < cols - 1) ? (idx + 1)    : -1;
+
+      return new int[] { up, down, left, right };
+    }
+
+    private static boolean touchesOccupiedNeighbour(OccupancyGrid ogrid, int idx, int cols, int rows, double occThresh) {
+      for (int nb : neigh4(idx, cols, rows)) {
+        if (nb < 0) continue;
+        if (ogrid.get_cell_probability(nb) >= occThresh) return true;
+      }
+      return false;
+    }
+
+    private static List<Integer> reconstruct(int[] cameFrom, int cur) {
+      ArrayList<Integer> path = new ArrayList<>();
+      int x = cur;
+      while (x != -1) {
+        path.add(x);
+        x = cameFrom[x];
+      }
+      Collections.reverse(path);
+      return path;
+    }
+  }
+}
