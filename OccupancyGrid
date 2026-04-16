@@ -1,0 +1,320 @@
+// File: OccupancyGrid.java
+// Date: 14 Dec 2025
+// Description: OccupancyGrid Class support for COMP329 Programming Assignment
+// Author: Terry Payne / Updated for Robustness
+//
+// Ray-based mapping version tuned for:
+// - Pioneer 3DX, so0..so15 distance sensors
+// - grid_scale = 20 (cell size ~ 0.05m)
+// - maxRange ~ 5.0m
+//
+// Key changes for cleaner output:
+// 1) Only cast FREE rays when there is a real hit (z < zMax). This reduces speckle massively.
+// 2) Tuned log-odds (stronger occupied, weaker free).
+// 3) Tuned HALFALPHA for 5cm grid cells.
+// 4) Keep "free cannot erase strong occupied" guard.
+// 5) Clamp log-odds and correct grid lines loop bounds.
+
+import com.cyberbotics.webots.controller.Supervisor;
+import com.cyberbotics.webots.controller.Display;
+import com.cyberbotics.webots.controller.Node;
+import com.cyberbotics.webots.controller.Field;
+
+public class OccupancyGrid {
+
+  // --------------------------------
+  // Robot state variables
+  private Supervisor robot;
+  private Pose robot_pose;
+  private PioneerSimpleProxSensors prox_sensors;
+  private double radius;
+
+  // --------------------------------
+  // Display state variables
+  private Display display;
+  private int device_width;
+  private int device_height;
+  private double scale_factor;
+
+  // --------------------------------
+  // Occupancy Grid variables
+  private Node arena;
+  private double[] grid;     // log-odds
+  private int num_row_cells; // x-cells
+  private int num_col_cells; // y-cells
+  private int cell_width;    // display pixels per cell (x)
+  private int cell_height;   // display pixels per cell (y)
+  private double arena_width;
+  private double arena_height;
+  private double coverage;
+
+  // --------------------------------
+  // Log-odds parameters (tuned for cleaner maps)
+  private final double lprior = 0.0;                  // log(0.5/0.5)
+  private final double LOCC  = Math.log(0.90 / 0.10); // stronger wall evidence
+  private final double LFREE = Math.log(0.45 / 0.55); // weaker free evidence (less erosion/speckle)
+
+  // Ray model parameters (tuned for 20 cells/m => 5cm cells)
+  private final double HALFALPHA = 0.06;              // ~6cm endpoint tolerance (~1 cell)
+  private final double LMIN = -10.0;
+  private final double LMAX =  10.0;
+
+  // If a cell is already pretty occupied, don't allow free updates to reduce it
+  private final double OCC_LOCK_THRESHOLD = 2.0;
+
+  // ==================================================================================
+  // Constructor
+  // ==================================================================================
+  public OccupancyGrid(Supervisor r,
+                       int grid_scale,
+                       String display_name,
+                       Pose p,
+                       PioneerSimpleProxSensors prox_sensors) {
+    this.robot = r;
+    this.robot_pose = p;
+    this.prox_sensors = prox_sensors;
+    this.radius = prox_sensors.get_radius();
+
+    // Arena
+    this.arena = robot.getFromDef("ARENA");
+    if (this.arena == null) {
+      System.err.println("COMP329 >>>Please define the DEF parameter of the RectangleArena as ARENA in the scene tree.<<<");
+      return;
+    }
+    Field floorSizeField = arena.getField("floorSize");
+    double[] floorSize = floorSizeField.getSFVec2f();
+    this.arena_width = floorSize[0];
+    this.arena_height = floorSize[1];
+
+    // Grid size: grid_scale cells per meter
+    this.num_row_cells = (int) (grid_scale * arena_width);
+    this.num_col_cells = (int) (grid_scale * arena_height);
+
+    System.out.println(String.format("Building an Occupancy Grid Map of size %d x %d",
+                        this.num_row_cells, this.num_col_cells));
+
+    this.grid = new double[this.num_row_cells * this.num_col_cells];
+    for (int i = 0; i < this.grid.length; i++) this.grid[i] = lprior;
+
+    // Display
+    this.display = this.robot.getDisplay(display_name);
+    if (this.display != null) {
+      this.device_width = this.display.getWidth();
+      this.device_height = this.display.getHeight();
+
+      double wsf = ((double) this.device_width) / this.arena_width;
+      double hsf = ((double) this.device_height) / this.arena_height;
+      this.scale_factor = Math.min(wsf, hsf);
+
+      this.cell_width = this.device_width / this.num_row_cells;
+      this.cell_height = this.device_height / this.num_col_cells;
+    } else {
+      this.device_width = 0;
+      this.device_height = 0;
+      this.scale_factor = 0.0;
+    }
+  }
+
+  // ==================================================================================
+  // Getters / Setters
+  // ==================================================================================
+  public int get_num_row_cells() { return this.num_row_cells; }
+  public int get_num_col_cells() { return this.num_col_cells; }
+  public int get_grid_size() { return this.grid.length; }
+  public double get_cell_probability(int index) { return cell_probability(grid[index]); }
+
+  public void set_pose(Pose p) {
+    this.robot_pose.setPosition(p.getX(), p.getY(), p.getTheta());
+  }
+
+  // Map real coordinates to screen coordinates
+  private int scale(double l) { return (int) (this.scale_factor * l); }
+  private int mapx(double x) { return (int) ((this.device_width / 2.0) + this.scale(x)); }
+  private int mapy(double y) { return (int) ((this.device_height / 2.0) - this.scale(y)); }
+
+  private double cell_probability(double lodds) {
+    return 1.0 - (1.0 / (1.0 + Math.exp(lodds)));
+  }
+
+  // Helper: clamp log-odds
+  private double clamp(double v) {
+    if (v > LMAX) return LMAX;
+    if (v < LMIN) return LMIN;
+    return v;
+  }
+
+  // Convert world (x,y) -> grid index, returns -1 if outside arena
+  private int worldToIndex(double x, double y) {
+    // Arena is centered at (0,0) in world coords
+    double x0 = -arena_width / 2.0;
+    double y0 =  arena_height / 2.0;
+
+    double x_inc = arena_width / num_row_cells;
+    double y_inc = arena_height / num_col_cells;
+
+    int ix = (int) Math.floor((x - x0) / x_inc);
+    int iy = (int) Math.floor((y0 - y) / y_inc); // y inverted
+
+    if (ix < 0 || ix >= num_row_cells || iy < 0 || iy >= num_col_cells) return -1;
+    return iy * num_row_cells + ix;
+  }
+
+  // Add log-odds update with robustness rule for free updates
+  private void applyUpdate(int idx, double delta) {
+    if (idx < 0) return;
+
+    // Do not allow free to erase strong occupied cells
+    if (delta == LFREE && grid[idx] > OCC_LOCK_THRESHOLD) return;
+
+    grid[idx] = clamp(grid[idx] + delta);
+  }
+
+  // ==================================================================================
+  // Mapping update (Ray-based, per sensor)
+  // ==================================================================================
+  public void map(Pose p) {
+    if (this.arena == null) return;
+
+    this.robot_pose.setPosition(p.getX(), p.getY(), p.getTheta());
+
+    int n = prox_sensors.get_number_of_sensors();
+    double zMax = prox_sensors.get_maxRange();
+
+    // Cell step size in meters (use half a cell for smoother rays)
+    double x_inc = arena_width / num_row_cells;
+    double y_inc = arena_height / num_col_cells;
+    double step = 0.5 * Math.min(x_inc, y_inc);
+
+    // Precompute robot rotation
+    double ct = Math.cos(robot_pose.getTheta());
+    double st = Math.sin(robot_pose.getTheta());
+
+    for (int i = 0; i < n; i++) {
+      Pose sRel = prox_sensors.get_relative_sensor_pose(i);
+
+      // Sensor world position (rigid-body transform)
+      double sX = robot_pose.getX() + ct * sRel.getX() - st * sRel.getY();
+      double sY = robot_pose.getY() + st * sRel.getX() + ct * sRel.getY();
+      double sTheta = robot_pose.getTheta() + sRel.getTheta();
+
+      double z = prox_sensors.get_value(i);
+
+      // If no hit (max range), DO NOT "free-clear" huge areas (major speckle reduction)
+      if (z >= zMax) continue;
+
+      // Clamp ray length
+      double rayLen = Math.min(z, zMax);
+
+      // Ignore tiny noisy readings
+      if (rayLen <= 0.02) continue;
+
+      // Mark FREE up to (rayLen - HALFALPHA)
+      double freeLimit = Math.max(0.0, rayLen - HALFALPHA);
+
+      for (double t = 0.0; t <= freeLimit; t += step) {
+        double wx = sX + Math.cos(sTheta) * t;
+        double wy = sY + Math.sin(sTheta) * t;
+
+        int idx = worldToIndex(wx, wy);
+        if (idx == -1) break;
+
+        applyUpdate(idx, LFREE);
+      }
+
+      // Mark OCCUPIED at the hit endpoint (and a tiny band around it for stability)
+      for (double t = rayLen - HALFALPHA; t <= rayLen + HALFALPHA; t += step) {
+        if (t < 0.0) continue;
+        double hx = sX + Math.cos(sTheta) * t;
+        double hy = sY + Math.sin(sTheta) * t;
+
+        int hitIdx = worldToIndex(hx, hy);
+        if (hitIdx != -1) applyUpdate(hitIdx, LOCC);
+      }
+    }
+  }
+
+  // ==================================================================================
+  // Display
+  // ==================================================================================
+  public void paint() {
+    if (this.display == null) return;
+
+    // Clear background
+    this.display.setColor(0xF0F0F0);
+    this.display.fillRectangle(0, 0, this.device_width, this.device_height);
+
+    this.coverage = 0.0;
+
+    // Precompute ratios (avoid repeated division)
+    double pxPerCol = this.device_width  / (double) this.num_row_cells;
+    double pxPerRow = this.device_height / (double) this.num_col_cells;
+
+    for (int i = 0; i < this.grid.length; i++) {
+      double cellProb = this.cell_probability(this.grid[i]);
+
+      int col = (i % this.num_row_cells);
+      int row = (i / this.num_row_cells);
+
+      // Pixel boundaries for this cell (fills full width/height, no leftover gap)
+      int x0 = (int) Math.round(col * pxPerCol);
+      int x1 = (int) Math.round((col + 1) * pxPerCol);
+      int y0 = (int) Math.round(row * pxPerRow);
+      int y1 = (int) Math.round((row + 1) * pxPerRow);
+
+      int w = x1 - x0;
+      int h = y1 - y0;
+
+      // strong white/free, black/occupied, mid-grey unknown
+      if (cellProb > 0.75) this.display.setColor(0x000000);       // Occupied
+      else if (cellProb < 0.25) this.display.setColor(0xFFFFFF);  // Free
+      else this.display.setColor(0xB8B8B8);                       // Unknown
+
+      this.display.fillRectangle(x0, y0, w, h);
+
+      if ((cellProb < 0.25) || (cellProb > 0.75))
+        this.coverage += 1.0;
+    }
+
+    this.coverage = this.coverage / this.grid.length;
+
+    // Optional grid lines (perfectly aligned to pixel boundaries)
+    this.display.setColor(0x3C3C3C);
+
+    for (int c = 0; c <= this.num_row_cells; c++) {
+      int x = (int) Math.round(c * pxPerCol);
+      this.display.drawLine(x, 0, x, this.device_height);
+    }
+
+    for (int r = 0; r <= this.num_col_cells; r++) {
+      int y = (int) Math.round(r * pxPerRow);
+      this.display.drawLine(0, y, this.device_width, y);
+    }
+
+    // Draw robot body
+    this.display.setColor(0xFFFFFF);
+    this.display.fillOval(this.mapx(this.robot_pose.getX()),
+                          this.mapy(this.robot_pose.getY()),
+                          this.scale(this.radius),
+                          this.scale(this.radius));
+
+    this.display.setColor(0x3C3C3C);
+    this.display.drawOval(this.mapx(this.robot_pose.getX()),
+                          this.mapy(this.robot_pose.getY()),
+                          this.scale(this.radius),
+                          this.scale(this.radius));
+
+    // Heading line
+    this.display.setColor(0xFF0000);
+    this.display.drawLine(this.mapx(this.robot_pose.getX()),
+                          this.mapy(this.robot_pose.getY()),
+                          this.mapx(this.robot_pose.getX() + Math.cos(this.robot_pose.getTheta()) * this.radius),
+                          this.mapy(this.robot_pose.getY() + Math.sin(this.robot_pose.getTheta()) * this.radius));
+
+    // Coverage text
+    this.display.setColor(0x000000);
+    this.display.drawText(String.format("%.2f%%", this.coverage * 100),
+                          this.device_width - 60,
+                          this.device_height - 14);
+  }
+
+}
