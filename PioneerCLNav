@@ -1,0 +1,233 @@
+// PioneerCLNav.java
+/*
+ * File: PioneerCLNav.java
+ * Description: Goal seeking + simple Bug-style wall following (range sensors).
+ *
+ * Purpose for now:
+ * - Keep navigation reliable while we perfect exploration/frontiers.
+ * - Uses PioneerSimpleProxSensors (so0..so15).
+ *
+ * States:
+ *   GOALSEEK -> drive toward goal
+ *   WALLFOLLOW -> follow left wall with PID
+ * Leave condition (simple Bug2-ish):
+ *   If we are closer to goal than we were at hit time AND front is clear, leave wall.
+ */
+
+import com.cyberbotics.webots.controller.Motor;
+import com.cyberbotics.webots.controller.Supervisor;
+import com.cyberbotics.webots.controller.Node;
+
+public class PioneerCLNav {
+
+  private Supervisor robot;
+  private Node robot_node;
+  private PioneerSimpleProxSensors pps;
+  private Motor left_motor;
+  private Motor right_motor;
+
+  private Pose goal;
+
+  private enum NavState { GOALSEEK, WALLFOLLOW }
+  private NavState state;
+
+  // Goal parameters
+  private double goal_radius = 0.25;
+  private double accel_angle = 0.45;
+  private double cruise_vel  = 4.0;
+  private double near_vel    = 1.2;
+
+  // Obstacle thresholds
+  private double front_hit = 0.55;     // switch to wall follow
+  private double front_clear = 0.85;   // allow leaving wall follow
+
+  // Wall-follow parameters (left wall)
+  private double wf_dist = 0.70;
+  private double wf_vel  = 3.0;
+
+  // PID
+  private double prev_error = 0.0;
+  private double total_error = 0.0;
+
+  private double max_vel;
+
+  // Bug memory
+  private double hit_goal_dist = Double.POSITIVE_INFINITY;
+
+  public PioneerCLNav(Supervisor robot, PioneerSimpleProxSensors pps) {
+    this.robot = robot;
+    this.robot_node = robot.getSelf();
+    this.pps = pps;
+
+    this.goal = get_real_pose();
+    this.state = NavState.GOALSEEK;
+
+    this.left_motor = robot.getMotor("left wheel");
+    this.right_motor = robot.getMotor("right wheel");
+    this.left_motor.setPosition(Double.POSITIVE_INFINITY);
+    this.right_motor.setPosition(Double.POSITIVE_INFINITY);
+
+    this.max_vel = this.left_motor.getMaxVelocity();
+
+    stop();
+  }
+
+  // -----------------------------
+  // Sensor helpers
+  private double range_to_front() {
+    double r = pps.get_maxRange();
+    r = Math.min(r, pps.get_value(2));
+    r = Math.min(r, pps.get_value(3));
+    r = Math.min(r, pps.get_value(4));
+    r = Math.min(r, pps.get_value(5));
+    return r;
+  }
+
+  private double range_to_left() {
+    double r = pps.get_maxRange();
+    r = Math.min(r, pps.get_value(0)); // left
+    return r;
+  }
+
+  // -----------------------------
+  // Math helpers
+  private double clamp(double v, double lo, double hi) {
+    return Math.max(lo, Math.min(hi, v));
+  }
+
+  private double wrapToPi(double a) {
+    while (a > Math.PI) a -= 2.0 * Math.PI;
+    while (a < -Math.PI) a += 2.0 * Math.PI;
+    return a;
+  }
+
+  private void set_velocity(double lv, double rv) {
+    left_motor.setVelocity(clamp(lv, -max_vel, max_vel));
+    right_motor.setVelocity(clamp(rv, -max_vel, max_vel));
+  }
+
+  private void adjust_velocity(double turn_rate, double velocity) {
+    double lv = velocity - turn_rate;
+    double rv = velocity + turn_rate;
+    set_velocity(lv, rv);
+  }
+
+  private boolean rotate(double bearing, double vel) {
+    double tol = 0.10;
+    if (Math.abs(bearing) < tol) return true;
+    double dir = (bearing > 0) ? 1.0 : -1.0;
+    double v = clamp(Math.abs(vel), 1.0, max_vel);
+    set_velocity(-dir * v, dir * v);
+    return false;
+  }
+
+  private double pid(double error) {
+    double kp = 0.9;
+    double ki = 0.0;
+    double kd = 0.25;
+
+    total_error += error;
+    double diff = error - prev_error;
+    prev_error = error;
+
+    return (kp * error) + (ki * total_error) + (kd * diff);
+  }
+
+  // -----------------------------
+  // Behaviours
+  private void goal_seek(Pose p) {
+    double dx = goal.getX() - p.getX();
+    double dy = goal.getY() - p.getY();
+    double dist = Math.sqrt(dx * dx + dy * dy);
+
+    double desired = Math.atan2(dy, dx);
+    double bearing = wrapToPi(desired - p.getTheta());
+
+    // obstacle -> wall follow
+    if (range_to_front() < front_hit) {
+      hit_goal_dist = dist;
+      state = NavState.WALLFOLLOW;
+      stop();
+      return;
+    }
+
+    if (Math.abs(bearing) > accel_angle) {
+      rotate(bearing, 2.2);
+      return;
+    }
+
+    double v = cruise_vel;
+    if (dist < 1.0) v = Math.max(near_vel, cruise_vel * (dist / 1.0));
+
+    // simple steering: use bearing directly as turn rate
+    adjust_velocity(bearing, v);
+  }
+
+  private void wall_follow(Pose p) {
+
+    // Emergency turn if something is straight ahead
+    if (range_to_front() < 0.40) {
+      // turn right on the spot-ish
+      adjust_velocity(-3.0, 0.6);
+      return;
+    }
+
+    // Left-wall PID
+    double d = range_to_left();
+    if (d > 1.2) d = 1.2; // avoid “infinite” values dominating
+
+    double error = wf_dist - d;
+    double turn = pid(error);
+
+    // Follow along wall
+    adjust_velocity(turn, wf_vel);
+
+    // Leave condition (simple Bug2-ish)
+    double distToGoal = p.get_range(goal);
+    if (distToGoal < hit_goal_dist - 0.15 && range_to_front() > front_clear) {
+      state = NavState.GOALSEEK;
+    }
+  }
+
+  // -----------------------------
+  // Public API
+  public void stop() {
+    set_velocity(0.0, 0.0);
+  }
+
+  public void set_goal(Pose g) {
+    this.goal = new Pose(g);
+    this.state = NavState.GOALSEEK;
+    this.prev_error = 0.0;
+    this.total_error = 0.0;
+  }
+
+  public boolean update() {
+    Pose p = get_real_pose();
+
+    if (p.get_range(goal) < goal_radius) {
+      stop();
+      return true;
+    }
+
+    if (state == NavState.GOALSEEK) goal_seek(p);
+    else wall_follow(p);
+
+    return false;
+  }
+
+  // Ground-truth pose (Supervisor)
+  public Pose get_real_pose() {
+    if (robot_node == null) return new Pose(0, 0, 0);
+
+    double[] realPos = robot_node.getPosition();
+    double[] rot = robot_node.getOrientation();
+
+    double theta1 = Math.atan2(-rot[0], rot[3]);
+    double halfPi = Math.PI / 2;
+    double theta2 = theta1 + halfPi;
+    if (theta1 > halfPi) theta2 = -(3 * halfPi) + theta1;
+
+    return new Pose(realPos[0], realPos[1], theta2);
+  }
+}
