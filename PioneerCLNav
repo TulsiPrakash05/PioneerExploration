@@ -38,8 +38,8 @@ public class PioneerCLNav {
   private double near_vel    = 1.2;
 
   // Obstacle thresholds
-  private double front_hit = 0.55;     // switch to wall follow
-  private double front_clear = 0.85;   // allow leaving wall follow
+  private double front_hit = 0.35;     // switch to wall follow
+  private double front_clear = 0.60;   // allow leaving wall follow
 
   // Wall-follow parameters (left wall)
   private double wf_dist = 0.70;
@@ -139,12 +139,18 @@ public class PioneerCLNav {
     double dx = goal.getX() - p.getX();
     double dy = goal.getY() - p.getY();
     double dist = Math.sqrt(dx * dx + dy * dy);
+    
+    if (dist < 1.0) {
+      front_hit = 0.25;
+    } else {
+      front_hit = 0.35; // reset
+    }
 
     double desired = Math.atan2(dy, dx);
     double bearing = wrapToPi(desired - p.getTheta());
 
     // obstacle -> wall follow
-    if (range_to_front() < front_hit) {
+    if (range_to_front() < front_hit && Math.abs(bearing) < 0.3) {
       hit_goal_dist = dist;
       state = NavState.WALLFOLLOW;
       stop();
