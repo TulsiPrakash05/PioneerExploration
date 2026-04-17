@@ -20,6 +20,10 @@ import com.cyberbotics.webots.controller.Field;
 import java.util.*;
 
 public class MyAssignmentController {
+ 
+``private static Set<Integer> visitedFrontiers = new HashSet<>();
+  private static int lastFrontier = -1;
+  private static int sameFrontierCount = 0;
 
   // ---------------------------
   // Exploration FSM
@@ -65,7 +69,7 @@ public class MyAssignmentController {
   private static final double NEAR_WALL_PENALTY = 0.5;
 
   // How often we downsample path into subgoals (cells)
-  private static final int PATH_STRIDE_CELLS = 8;
+  private static final int PATH_STRIDE_CELLS = 4;
 
   public static void main(String[] args) {
 
@@ -159,19 +163,38 @@ public class MyAssignmentController {
         }
 
         case SELECT_WAYPOINT: {
-
+    
       int cols = ogrid.get_num_row_cells();
       int rows = ogrid.get_num_col_cells();
     
       int startIdx = worldToIndex(pose.getX(), pose.getY(), arenaW, arenaH, cols, rows);
     
       int frontierIdx = selectBestFrontier(ogrid, pose, arenaW, arenaH, cols, rows);
+      
+      // To track repeated frontier selection 
+      if (frontierIdx == lastFrontier) {
+        sameFrontierCount++;
+      } else {
+        sameFrontierCount = 0;
+      }
+      
+      lastFrontier = frontierIdx;
+      
+      // global room searching is to be forced if stuck choosing same frontier
+      if (sameFrontierCount > 3) {
+        System.out.println("FORCING EXPLORATION (escape room)");
+      
+        visitedFrontiers.clear(); // reset bias
+        sameFrontierCount = 0;
+      }
     
       if (frontierIdx == -1) {
         System.out.println("No frontiers left -> finish");
         state = ExploreState.FINISH;
         break;
       }
+    
+      visitedFrontiers.add(frontierIdx); 
     
       Pose wp = indexToWorld(frontierIdx, arenaW, arenaH, cols, rows);
     
@@ -180,7 +203,7 @@ public class MyAssignmentController {
               UNKNOWN_STEP_PENALTY, NEAR_WALL_PENALTY);
     
       if (pathIdxs == null || pathIdxs.size() < 2) {
-        System.out.println("A* failed for frontier -> retry");
+        System.out.println("A* failed -> retry frontier");
         break;
       }
     
@@ -194,7 +217,7 @@ public class MyAssignmentController {
       currentPath.add(new Pose(wp));
     
       Pose first = currentPath.get(0);
-      System.out.println(String.format("Frontier selected -> path with %d subgoals. First (%.2f, %.2f)",
+      System.out.println(String.format("Frontier selected -> %d subgoals. First (%.2f, %.2f)",
               currentPath.size(), first.getX(), first.getY()));
     
       nav.set_goal(first);
@@ -210,7 +233,11 @@ public class MyAssignmentController {
           boolean reached = nav.update();
 
           if (stuck) {
-            System.out.println("STUCK -> RECOVER");
+            System.out.println("STUCK -> RECOVER + RESET FRONTIERS");
+          
+            visitedFrontiers.clear();
+            sameFrontierCount = 0;
+          
             state = ExploreState.RECOVER;
             break;
           }
@@ -267,7 +294,7 @@ public class MyAssignmentController {
   }
 
   // ---------------------------
-  // Serpentine sweep waypoints
+  //
   private static List<Pose> buildSerpentineWaypoints(double arenaW, double arenaH, double margin, double spacing) {
     ArrayList<Pose> wps = new ArrayList<>();
 
@@ -364,7 +391,7 @@ public class MyAssignmentController {
   }
 
   // ---------------------------
-  // Recovery hop
+  // Recovery 
   private static Pose makeRecoveryGoal(Random rng, Pose pose,
                                       double arenaW, double arenaH,
                                       double margin,
@@ -388,7 +415,7 @@ public class MyAssignmentController {
   }
 
   // ---------------------------
-  // world->grid (same as your OccupancyGrid logic)
+  //
   private static int worldToIndex(double x, double y,
                                   double arenaW, double arenaH,
                                   int cols, int rows) {
@@ -424,6 +451,107 @@ public class MyAssignmentController {
   private static double clamp(double v, double lo, double hi) {
     return Math.max(lo, Math.min(hi, v));
   }
+  
+  private static int[] getNeighbours(int idx, int cols, int rows) {
+    int x = idx % cols;
+    int y = idx / cols;
+  
+    int up    = (y > 0)        ? (idx - cols) : -1;
+    int down  = (y < rows - 1) ? (idx + cols) : -1;
+    int left  = (x > 0)        ? (idx - 1)    : -1;
+    int right = (x < cols - 1) ? (idx + 1)    : -1;
+  
+    return new int[] { up, down, left, right };
+  }
+  
+  private static boolean isFrontier(OccupancyGrid ogrid, int idx, int cols, int rows) {
+    double p = ogrid.get_cell_probability(idx);
+  
+    if (p > KNOWN_FREE_THRESH) return false;
+  
+    for (int n : getNeighbours(idx, cols, rows)) {
+      if (n < 0) continue;
+  
+      double np = ogrid.get_cell_probability(n);
+  
+      if (np > KNOWN_FREE_THRESH && np < KNOWN_OCC_THRESH)
+        return true;
+    }
+  
+    return false;
+  }
+  
+  private static List<Integer> getAllFrontiers(OccupancyGrid ogrid, int cols, int rows) {
+    List<Integer> frontiers = new ArrayList<>();
+  
+    for (int i = 0; i < ogrid.get_grid_size(); i++) {
+      if (isFrontier(ogrid, i, cols, rows)) {
+        frontiers.add(i);
+      }
+    }
+  
+    return frontiers;
+  }
+  
+  private static double computeUtility(OccupancyGrid ogrid,
+                                     int idx,
+                                     Pose robotPose,
+                                     double arenaW, double arenaH,
+                                     int cols, int rows) {
+
+    Pose p = indexToWorld(idx, arenaW, arenaH, cols, rows);
+  
+    double dist = robotPose.get_range(p);
+  
+    // larger radius
+    int unknown = countUnknownAround(ogrid, p, arenaW, arenaH, cols, rows, 15);
+  
+    // new penalty 
+    double revisitPenalty = visitedFrontiers.contains(idx) ? 80.0 : 0.0;
+  
+    // distance utility 
+    double explorationBoost = dist * 1.5;
+  
+    double utility = (6.0 * unknown)
+               + (2.5 * dist)
+               - (1.0 * dist)
+               - revisitPenalty;
+    return utility;
+  }
+  
+  private static int selectBestFrontier(OccupancyGrid ogrid,
+                                      Pose robotPose,
+                                      double arenaW, double arenaH,
+                                      int cols, int rows) {
+
+    List<Integer> frontiers = getAllFrontiers(ogrid, cols, rows);
+  
+    double bestScore = -1e18;
+    int bestIdx = -1;
+  
+    for (int f : frontiers) {
+  
+      Pose p = indexToWorld(f, arenaW, arenaH, cols, rows);
+  
+      int unknown = countUnknownAround(ogrid, p, arenaW, arenaH, cols, rows, 6);
+  
+      // ignore weak frontiers, keep doorway exploring
+      if (unknown < 1) continue; 
+  
+      double score = computeUtility(ogrid, f, robotPose, arenaW, arenaH, cols, rows);
+  
+      if (score > bestScore) {
+        bestScore = score;
+        bestIdx = f;
+      }
+    }
+  
+    return bestIdx;
+  }
+  
+  
+
+
 
   // ============================================================
   // A* Planner (simple model)
