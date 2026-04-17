@@ -159,61 +159,52 @@ public class MyAssignmentController {
         }
 
         case SELECT_WAYPOINT: {
-          if (allVisited(visitedWaypoints)) {
-            System.out.println("All waypoints visited -> reset for second pass.");
-            Arrays.fill(visitedWaypoints, false);
-          }
 
-          // Pick a waypoint that looks promising
-          currentWpIndex = selectBestWaypoint(waypoints, visitedWaypoints, visitedGoalCells,
-                  ogrid, pose, arenaW, arenaH, rng);
-
-          Pose wp = waypoints.get(currentWpIndex);
-
-          // Mark goal cell visited (for later use)
-          int cols = ogrid.get_num_row_cells();
-          int rows = ogrid.get_num_col_cells();
-          int wpIdx = worldToIndex(wp.getX(), wp.getY(), arenaW, arenaH, cols, rows);
-          if (wpIdx >= 0 && wpIdx < visitedGoalCells.length) visitedGoalCells[wpIdx] = true;
-
-          // ---------------------------
-          // A* plan from robot -> waypoint
-          int startIdx = worldToIndex(pose.getX(), pose.getY(), arenaW, arenaH, cols, rows);
-          int goalIdx  = worldToIndex(wp.getX(),   wp.getY(),   arenaW, arenaH, cols, rows);
-
-          List<Integer> pathIdxs = AStar.plan(ogrid, cols, rows, startIdx, goalIdx,
-                  KNOWN_FREE_THRESH, KNOWN_OCC_THRESH,
-                  UNKNOWN_STEP_PENALTY, NEAR_WALL_PENALTY);
-
-          if (pathIdxs == null || pathIdxs.size() < 2) {
-            // Not currently reachable with what we know -> mark visited and try another
-            visitedWaypoints[currentWpIndex] = true;
-            System.out.println("A* failed for waypoint #" + currentWpIndex + " -> try another.");
-            break;
-          }
-
-          // Convert path into sub-goals (downsample)
-          currentPath.clear();
-          pathPtr = 0;
-
-          for (int k = 0; k < pathIdxs.size(); k += PATH_STRIDE_CELLS) {
-            Pose g = indexToWorld(pathIdxs.get(k), arenaW, arenaH, cols, rows);
-            currentPath.add(g);
-          }
-          // Ensure final waypoint is the last subgoal
-          currentPath.add(new Pose(wp));
-
-          Pose first = currentPath.get(0);
-          System.out.println(String.format("Waypoint #%d -> path with %d subgoals. First (%.2f, %.2f)",
-                  currentWpIndex, currentPath.size(), first.getX(), first.getY()));
-
-          nav.set_goal(first);
-          lastProgressPose = new Pose(pose);
-          lastProgressTime = now;
-
-          state = ExploreState.FOLLOW_PATH;
-          break;
-        }
+      int cols = ogrid.get_num_row_cells();
+      int rows = ogrid.get_num_col_cells();
+    
+      int startIdx = worldToIndex(pose.getX(), pose.getY(), arenaW, arenaH, cols, rows);
+    
+      int frontierIdx = selectBestFrontier(ogrid, pose, arenaW, arenaH, cols, rows);
+    
+      if (frontierIdx == -1) {
+        System.out.println("No frontiers left -> finish");
+        state = ExploreState.FINISH;
+        break;
+      }
+    
+      Pose wp = indexToWorld(frontierIdx, arenaW, arenaH, cols, rows);
+    
+      List<Integer> pathIdxs = AStar.plan(ogrid, cols, rows, startIdx, frontierIdx,
+              KNOWN_FREE_THRESH, KNOWN_OCC_THRESH,
+              UNKNOWN_STEP_PENALTY, NEAR_WALL_PENALTY);
+    
+      if (pathIdxs == null || pathIdxs.size() < 2) {
+        System.out.println("A* failed for frontier -> retry");
+        break;
+      }
+    
+      currentPath.clear();
+      pathPtr = 0;
+    
+      for (int k = 0; k < pathIdxs.size(); k += PATH_STRIDE_CELLS) {
+        currentPath.add(indexToWorld(pathIdxs.get(k), arenaW, arenaH, cols, rows));
+      }
+    
+      currentPath.add(new Pose(wp));
+    
+      Pose first = currentPath.get(0);
+      System.out.println(String.format("Frontier selected -> path with %d subgoals. First (%.2f, %.2f)",
+              currentPath.size(), first.getX(), first.getY()));
+    
+      nav.set_goal(first);
+    
+      lastProgressPose = new Pose(pose);
+      lastProgressTime = now;
+    
+      state = ExploreState.FOLLOW_PATH;
+      break;
+    }
 
         case FOLLOW_PATH: {
           boolean reached = nav.update();
